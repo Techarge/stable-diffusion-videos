@@ -18,17 +18,34 @@ from diffusers.schedulers import LMSDiscreteScheduler
 import torch
 import youtube_dl
 import os
+from loguru import logger
+from diffusers import StableDiffusionPipeline, UNet2DConditionModel, DDIMScheduler, AutoencoderKL, PNDMScheduler, \
+    EulerAncestralDiscreteScheduler, DPMSolverMultistepScheduler
+from accelerate import Accelerator
 
-pipe = StableDiffusionWalkPipeline.from_pretrained(
-    'runwayml/stable-diffusion-v1-5',
-    vae=AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-ema"),
-    torch_dtype=torch.float16,
-    revision="fp16",
-    safety_checker=None,
-    scheduler=LMSDiscreteScheduler(
-        beta_start=0.00085, beta_end=0.012, beta_schedule="scaled_linear"
-    )
-).to("cuda")
+gradient_accumulation_steps = 1
+torch.backends.cuda.matmul.allow_tf32 = True
+accelerator = Accelerator(
+    gradient_accumulation_steps=gradient_accumulation_steps,
+    mixed_precision="fp16",
+    log_with=None,
+    logging_dir="./logs",
+)
+
+torch_dtype = torch.float16 if accelerator.device.type == "cuda" else torch.float32
+
+torch.backends.cudnn.benchmark = True
+
+# pipe = StableDiffusionWalkPipeline.from_pretrained(
+#     'runwayml/stable-diffusion-v1-5',
+#     #vae=AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-ema"),
+#     torch_dtype=torch.float16,
+#     revision="fp16",
+#     safety_checker=None,
+#     scheduler=LMSDiscreteScheduler(
+#         beta_start=0.00085, beta_end=0.012, beta_schedule="scaled_linear"
+#     )
+# ).to("cuda")
 
 
 def download_example_clip(url, output_dir='./', output_filename='%(title)s.%(ext)s'):
@@ -45,10 +62,11 @@ def download_example_clip(url, output_dir='./', output_filename='%(title)s.%(ext
     }
     with youtube_dl.YoutubeDL(ydl_opts) as ydl:
         ydl.download([url])
-    
+
     files_after = os.listdir(output_dir)
     return str(Path(output_dir) / list(set(files_after) - set(files_before))[0])
-    
+
+
 def audio_data_to_buffer(y, sr):
     audio_filepath = BytesIO()
     audio_filepath.name = 'audio.wav'
@@ -59,13 +77,14 @@ def audio_data_to_buffer(y, sr):
 
 def plot_array(y):
     fig = plt.figure()
-    x = np.arange(y.shape[0]) 
-    plt.title("Line graph") 
-    plt.xlabel("X axis") 
-    plt.ylabel("Y axis") 
-    plt.plot(x, y, color ="red") 
+    x = np.arange(y.shape[0])
+    plt.title("Line graph")
+    plt.xlabel("X axis")
+    plt.ylabel("Y axis")
+    plt.plot(x, y, color="red")
     plt.savefig('timesteps_chart.png')
     return fig
+
 
 def on_slice_btn_click(audio, audio_start_sec, duration, fps, smooth, margin):
     if audio is None:
@@ -85,18 +104,20 @@ def on_slice_btn_click(audio, audio_start_sec, duration, fps, smooth, margin):
     )
     return [gr.update(value=(sr, y), visible=True), gr.update(value=plot_array(T), visible=True)]
 
+
 def on_audio_change_or_clear(audio):
     if audio is None:
         return [
             gr.update(visible=False),
             gr.update(visible=False)
         ]
-    
+
     duration = librosa.get_duration(filename=audio)
     return [
         gr.update(maximum=int(duration), visible=True),
         gr.update(maximum=int(min(10, duration)), visible=True)
     ]
+
 
 def on_update_weight_settings_btn_click(sliced_audio, duration, fps, smooth, margin):
     if sliced_audio is None:
@@ -114,16 +135,17 @@ def on_update_weight_settings_btn_click(sliced_audio, duration, fps, smooth, mar
 
 
 def on_generate_images_btn_click(
-    prompt_a,
-    prompt_b,
-    seed_a,
-    seed_b,
-    output_dir,
-    num_inference_steps,
-    guidance_scale,
-    height,
-    width,
-    upsample,
+        prompt_a,
+        prompt_b,
+        seed_a,
+        seed_b,
+        output_dir,
+        num_inference_steps,
+        guidance_scale,
+        height,
+        width,
+        upsample,
+        model_path="runwayml/stable-diffusion-v1-5",
 ):
     output_dir = Path(output_dir) / 'images'
 
@@ -131,6 +153,37 @@ def on_generate_images_btn_click(
         seed_a = random.randint(0, 9999999)
     if seed_b == -1:
         seed_b = random.randint(0, 9999999)
+
+    logger.info(f"Loading pretrained unet: {model_path}")
+    revision = "fp16"
+    unet = UNet2DConditionModel.from_pretrained(
+        model_path,
+        subfolder="unet",
+        revision=revision,
+        torch_dtype=torch.float16,
+    )
+
+    pipe = StableDiffusionWalkPipeline.from_pretrained(
+        model_path,
+        # vae=AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-ema"),
+        unet=accelerator.unwrap_model(unet),
+        vae=AutoencoderKL.from_pretrained(
+            model_path,
+            subfolder="vae",
+            revision=revision,
+            torch_dtype=torch_dtype
+        ),
+        torch_dtype=torch.float16,
+        revision="fp16",
+        safety_checker=None,
+        # scheduler=LMSDiscreteScheduler(
+        #     beta_start=0.00085, beta_end=0.012, beta_schedule="scaled_linear"
+        # )
+    )
+
+    pipe.scheduler = DPMSolverMultistepScheduler.from_config(pipe.scheduler.config)
+    pipe.enable_xformers_memory_efficient_attention()
+    pipe.to("cuda")
 
     image_a_fpath = generate_images(
         pipe,
@@ -162,28 +215,57 @@ def on_generate_images_btn_click(
         gr.update(value=seed_b),
     ]
 
-def on_generate_music_video_btn_click(
-    audio_filepath,
-    audio_start_sec,
-    duration,
-    fps,
-    smooth,
-    margin,
-    prompt_a,
-    prompt_b,
-    seed_a,
-    seed_b,
-    batch_size,
-    output_dir,
-    num_inference_steps,
-    guidance_scale,
-    height,
-    width,
-    upsample,
-):
 
+def on_generate_music_video_btn_click(
+        audio_filepath,
+        audio_start_sec,
+        duration,
+        fps,
+        smooth,
+        margin,
+        prompt_a,
+        prompt_b,
+        seed_a,
+        seed_b,
+        batch_size,
+        output_dir,
+        num_inference_steps,
+        guidance_scale,
+        height,
+        width,
+        upsample,
+        model_path
+):
     if audio_filepath is None:
         return gr.update(visible=False)
+
+    logger.info(f"Loading pretrained unet: {model_path}")
+    revision = "fp16"
+    unet = UNet2DConditionModel.from_pretrained(
+        model_path,
+        subfolder="unet",
+        revision=revision,
+        torch_dtype=torch.float16,
+    )
+
+    pipe = StableDiffusionWalkPipeline.from_pretrained(
+        model_path,
+        # vae=AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-ema"),
+        unet=accelerator.unwrap_model(unet),
+        vae=AutoencoderKL.from_pretrained(
+            model_path,
+            subfolder="vae",
+            revision=revision,
+            torch_dtype=torch_dtype
+        ),
+        torch_dtype=torch.float16,
+        revision="fp16",
+        safety_checker=None,
+        #scheduler=LMSDiscreteScheduler(beta_start=0.00085, beta_end=0.012, beta_schedule="scaled_linear")
+    )
+    pipe.scheduler = DPMSolverMultistepScheduler.from_config(pipe.scheduler.config)
+    pipe.enable_xformers_memory_efficient_attention()
+    pipe.to("cuda")
 
     video_filepath = pipe.walk(
         prompts=[prompt_a, prompt_b],
@@ -202,11 +284,12 @@ def on_generate_music_video_btn_click(
         margin=margin,
         smooth=smooth,
     )
+    logger.info(f"Video saved to {video_filepath}")
     return gr.update(value=video_filepath, visible=True)
 
 
 audio_start_sec = gr.Slider(0, 10, 0, step=1, label="Start (sec)", interactive=True)
-duration = gr.Slider(0, 10, 1, step=1, label="Duration (sec)", interactive=True)
+duration = gr.Slider(0, 60, 1, step=1, label="Duration (sec)", interactive=True)
 slice_btn = gr.Button("Slice Audio")
 
 sliced_audio = gr.Audio(type='filepath')
@@ -217,8 +300,8 @@ smooth = gr.Slider(0, 1, 0.0, label="Smoothing", interactive=True)
 margin = gr.Slider(1.0, 20.0, 1.0, step=0.5, label="Margin Max", interactive=True)
 update_weight_settings_btn = gr.Button("Update Interpolation Weights")
 
-prompt_a = gr.Textbox(value='blueberry spaghetti', label="Prompt A")
-prompt_b = gr.Textbox(value='strawberry spaghetti', label="Prompt B")
+prompt_a = gr.Textbox(value='a photo of olis dog', label="Prompt A")
+prompt_b = gr.Textbox(value='a painting of olis dog, in the style of van gogh', label="Prompt B")
 seed_a = gr.Number(-1, label="Seed A", precision=0, interactive=True)
 seed_b = gr.Number(-1, label="Seed B", precision=0, interactive=True)
 generate_images_btn = gr.Button("Generate Images")
@@ -229,6 +312,10 @@ batch_size = gr.Slider(1, 32, 1, step=1, label="Batch Size", interactive=True)
 generate_music_video_btn = gr.Button("Generate Music Video")
 video = gr.Video(visible=False, label="Video")
 
+STEP_0_MARKDOWN = """
+## 1. Choose a model path (or use 'runwayml/stable-diffusion-v1-5')
+
+"""
 STEP_1_MARKDOWN = """
 ## 1. Upload Some Audio
 
@@ -269,23 +356,28 @@ Then, you can select prompts and seeds for generating images.
 If you set the seeds to -1, a random seed will be used and saved for you, so you can explore different images given the same prompt.
 """
 
-
+# model_path = f"{base_dir}/{model_id.split(':')[-1]}_output_{db_obj.instance_name}"
+# if os.path.exists(f"{model_path}/{db_obj.train_steps}"):
+#     mod = f"{base_dir}/{model_id.split(':')[-1]}_output_{db_obj.instance_name}/{db_obj.train_steps}"
 with gr.Blocks() as demo:
+    gr.Markdown(STEP_0_MARKDOWN)
+    model_path = gr.Textbox(value='/home/ling/Dropbox/AIDraw-Photos/8914e8aa-09de-42a2-b3a8-af941c95cfe3_output_olis/750',
+                            label="Model Path")
     gr.Markdown(STEP_1_MARKDOWN)
     audio = gr.Audio(type='filepath', interactive=True)
-    gr.Examples(
-        [
-            download_example_clip(
-                url='https://soundcloud.com/nateraw/thoughts',
-                output_dir='./music',
-                output_filename='thoughts.mp3'
-            )
-        ],
-        inputs=audio,
-        outputs=[audio_start_sec, duration],
-        fn=on_audio_change_or_clear,
-        cache_examples=True
-    )
+    # gr.Examples(
+    #     [
+    #         download_example_clip(
+    #             url='https://soundcloud.com/nateraw/thoughts',
+    #             output_dir='./music',
+    #             output_filename='thoughts.mp3'
+    #         )
+    #     ],
+    #     inputs=audio,
+    #     outputs=[audio_start_sec, duration],
+    #     fn=on_audio_change_or_clear,
+    #     cache_examples=True
+    # )
     audio.change(on_audio_change_or_clear, audio, [audio_start_sec, duration])
     audio.clear(on_audio_change_or_clear, audio, [audio_start_sec, duration])
 
@@ -294,7 +386,8 @@ with gr.Blocks() as demo:
     duration.render()
     slice_btn.render()
 
-    slice_btn.click(on_slice_btn_click, [audio, audio_start_sec, duration, fps, smooth, margin], [sliced_audio, wav_plot])
+    slice_btn.click(on_slice_btn_click, [audio, audio_start_sec, duration, fps, smooth, margin],
+                    [sliced_audio, wav_plot])
     sliced_audio.render()
 
     gr.Markdown(STEP_3_MARKDOWN)
@@ -314,10 +407,10 @@ with gr.Blocks() as demo:
             wav_plot.render()
 
     gr.Markdown(STEP_4_MARKDOWN)
-    
+
     with gr.Accordion("Additional Settings", open=False):
         output_dir = gr.Textbox(value='./dreams', label="Output Directory")
-        num_inference_steps = gr.Slider(1, 200, 50, step=10, label="Diffusion Inference Steps", interactive=True)
+        num_inference_steps = gr.Slider(1, 200, 25, step=5, label="Diffusion Inference Steps", interactive=True)
         guidance_scale = gr.Slider(1.0, 25.0, 7.5, step=0.5, label="Guidance Scale", interactive=True)
         height = gr.Slider(512, 1024, 512, step=64, label="Height", interactive=True)
         width = gr.Slider(512, 1024, 512, step=64, label="Width", interactive=True)
@@ -345,7 +438,8 @@ with gr.Blocks() as demo:
 
     generate_images_btn.click(
         on_generate_images_btn_click,
-        [prompt_a, prompt_b, seed_a, seed_b, output_dir, num_inference_steps, guidance_scale, height, width, upsample],
+        [prompt_a, prompt_b, seed_a, seed_b, output_dir, num_inference_steps, guidance_scale, height, width, upsample,
+         model_path],
         [image_a, image_b, seed_a, seed_b]
     )
 
@@ -355,11 +449,11 @@ with gr.Blocks() as demo:
     generate_music_video_btn.render()
     generate_music_video_btn.click(
         on_generate_music_video_btn_click,
-        [audio, audio_start_sec, duration, fps, smooth, margin, prompt_a, prompt_b, seed_a, seed_b, batch_size, output_dir, num_inference_steps, guidance_scale, height, width, upsample],
+        [audio, audio_start_sec, duration, fps, smooth, margin, prompt_a, prompt_b, seed_a, seed_b, batch_size,
+         output_dir, num_inference_steps, guidance_scale, height, width, upsample, model_path],
         video
     )
     video.render()
-
 
 if __name__ == '__main__':
     demo.launch(debug=True)
